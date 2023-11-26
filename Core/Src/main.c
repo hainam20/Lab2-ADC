@@ -22,11 +22,20 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "stdio.h"
+#include "stdint.h"
 #include "string.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef struct
+{
+	uint16_t voltage_src;
+	uint16_t shunt_voltage;
+	uint16_t bus_voltage;
+	uint16_t current;
+	uint16_t power; //Performance (hieu suat)
+}INA219_Measurement;
 
 /* USER CODE END PTD */
 
@@ -35,7 +44,21 @@
 #define MAX_CONV_RANGE 3.6 //(Conversion voltage range of ADC) Callib value based on which STM32 used
 #define MAX_ADC_RESOLUTION_VAL 4095 //STM32F103C8T6 ADC 12 bits
 #define ACCURACY_TEMPERATURE_CELCIUS 100 //10mv/Celcius based on LM35 datasheet
-//Datasheet: extension://bfdogplmndidlpjfhoijckpakkdjkkil/pdf/viewer.html?file=https%3A%2F%2Fwww.ti.com%2Flit%2Fds%2Fsymlink%2Flm35.pdf
+//Temperature Sensor Datasheet: extension://bfdogplmndidlpjfhoijckpakkdjkkil/pdf/viewer.html?file=https%3A%2F%2Fwww.ti.com%2Flit%2Fds%2Fsymlink%2Flm35.pdf
+
+//////////// INA219 ////////////
+//Define device address
+#define INA219_SLAVE_ADDRESS 0x40<<1
+//Define i2c protocol sensor register address - BEGIN
+#define INA219_CONFIG_REG 0x007
+#define INA219_SHUNTVOLTAGE_REG 0x01
+#define INA219_BUSVOLTAGE_REG 0x02
+#define INA219_POWER_REG 0x03
+#define INA219_CURRENT_REG 0x04
+#define INA219_CALLIB_REG 0x05
+//Define i2c protocol sensor register address - END
+
+///////////////////////////////
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -55,6 +78,9 @@ uint32_t raw_temperature_val = 0; //digital value output value from adc
 float voltage_temperature_convert = 0; //Voltage analog value convert
 float temperature = 0; //temperature after processing
 uint8_t Tx_Buffer[100]; //UART buffer
+
+INA219_Measurement ina_basic_measure;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -64,11 +90,77 @@ static void MX_ADC1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_I2C1_Init(void);
 /* USER CODE BEGIN PFP */
-
+void Ina219_Init(void);
+uint16_t eightbit_to_16bit_conv(uint8_t num1,uint8_t num2);
+void Ina219_Read_Value(INA219_Measurement *pTarget);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+void Ina219_Init(void)
+{
+	uint8_t buffer[3];
+	buffer[0] = INA219_CALLIB_REG;
+	buffer[1] = 0x01; //MSB callib reg
+	buffer[2] = 0x9A; //LSB callib reg
+	//init ina219 callibration
+	//28ms is time out value based on ina219 datasheet corresponding to SMBus
+	if(HAL_I2C_Master_Transmit(&hi2c1, INA219_SLAVE_ADDRESS,buffer,3,28) != HAL_OK) //that ra neu de noi ma init successfully thi phai check gia tri duoc ghi co that sư ghi chua
+	{
+		 memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
+		 sprintf((char*)Tx_Buffer,"INA219: I2C TRANSMIT CALLIB SUCCESSFULLY!\n");
+		 HAL_Delay(100);
+		 memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
+		 sprintf((char*)Tx_Buffer,"Ready to read data...\n");
+		 HAL_Delay(100);
+	}
+	else {
+		memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
+		sprintf((char*)Tx_Buffer,"INA219: TRANSMIT CALLIB FAILED!\n");
+		HAL_Delay(100);
+	}
+}
+
+void Ina219_Read_Value(INA219_Measurement *pTarget)
+{
+	uint8_t current_val_buffer[2];
+	uint8_t bus_voltage_val_buffer[2];
+	uint8_t shuntvoltage_val_buffer[2];
+	uint8_t power_val_buffer[2];
+
+	//bus voltage handle
+	HAL_I2C_Master_Transmit(&hi2c1, INA219_SLAVE_ADDRESS,(uint8_t*)INA219_CURRENT_REG,1,28);
+	HAL_I2C_Master_Receive(&hi2c1, INA219_SLAVE_ADDRESS,current_val_buffer,2,28);
+
+	//bus voltage handle
+	HAL_I2C_Master_Transmit(&hi2c1, INA219_SLAVE_ADDRESS,(uint8_t*)INA219_BUSVOLTAGE_REG,1,28);
+	HAL_I2C_Master_Receive(&hi2c1, INA219_SLAVE_ADDRESS,bus_voltage_val_buffer,2,28);
+
+	//power handle
+	HAL_I2C_Master_Transmit(&hi2c1, INA219_SLAVE_ADDRESS,(uint8_t*)INA219_POWER_REG,1,28);
+	HAL_I2C_Master_Receive(&hi2c1, INA219_SLAVE_ADDRESS,power_val_buffer,2,28);
+
+	//shunt voltage handle - may need to be calculated more to get accurate result with 2's complement
+	HAL_I2C_Master_Transmit(&hi2c1, INA219_SLAVE_ADDRESS,(uint8_t*)INA219_SHUNTVOLTAGE_REG,1,28);
+	HAL_I2C_Master_Receive(&hi2c1, INA219_SLAVE_ADDRESS,shuntvoltage_val_buffer,2,28);
+
+	pTarget->current = eightbit_to_16bit_conv(current_val_buffer[0], current_val_buffer[1]);
+	pTarget->bus_voltage = eightbit_to_16bit_conv(bus_voltage_val_buffer[0], bus_voltage_val_buffer[1]);
+	pTarget->shunt_voltage = eightbit_to_16bit_conv(shuntvoltage_val_buffer[0], shuntvoltage_val_buffer[1]);
+	pTarget->power = eightbit_to_16bit_conv(power_val_buffer[0], power_val_buffer[1]);
+
+	pTarget->voltage_src = pTarget->shunt_voltage + pTarget->bus_voltage;
+}
+
+uint16_t eightbit_to_16bit_conv(uint8_t num1,uint8_t num2)
+{
+	uint16_t result = (num1 << 8) | num2;
+	return result;
+}
+
+
+
+
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
  {
  	if(hadc->Instance == hadc1.Instance)
@@ -112,7 +204,7 @@ int main(void)
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
   HAL_ADC_Start_IT(&hadc1);
-
+  Ina219_Init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -121,19 +213,19 @@ int main(void)
   {
 	  ////////////LM35 - TEMPERATURE SENSOR //////////////
 	  //calculation to get temperature
-	  voltage_temperature_convert = (float)raw_temperature_val*MAX_CONV_RANGE/MAX_ADC_RESOLUTION_VAL;
-	  temperature = voltage_temperature_convert*ACCURACY_TEMPERATURE_CELCIUS;
+	  //voltage_temperature_convert = (float)raw_temperature_val*MAX_CONV_RANGE/MAX_ADC_RESOLUTION_VAL;
+	  //temperature = voltage_temperature_convert*100;
 	  ////////////LM35 - TEMPERATURE SENSOR //////////////
 
 	  ////////////INA219 - TEMPERATURE SENSOR //////////////
-	  // Researching then coding later
+	  //ina219_Read_Value(&ina_basic_measure);
 	  ////////////INA219 - TEMPERATURE SENSOR //////////////
 
 	  ////////////DEBUG OLED SSD1306 - ESP32 THROUGH UART //////////////
-	  memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
-	  sprintf((char*)Tx_Buffer,"\nTemperature: %f",temperature);
-	  HAL_UART_Transmit(&huart1,Tx_Buffer,sizeof(Tx_Buffer), 10);
-	  HAL_Delay(500); //each 500ms display temperature once
+	  //memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
+	  //sprintf((char*)Tx_Buffer,"Temp: %.2f C",temperature);
+	  //HAL_UART_Transmit(&huart1,Tx_Buffer,sizeof(Tx_Buffer), 10);
+	  //HAL_Delay(100); //each 500ms display temperature once
 	  ////////////DEBUG OLED SSD1306 - ESP32 THROUGH UART //////////////
     /* USER CODE END WHILE */
 
@@ -337,6 +429,9 @@ void Error_Handler(void)
   __disable_irq();
   while (1)
   {
+	  memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
+	  sprintf((char*)Tx_Buffer,"System init error\n");
+	  HAL_Delay(500);
   }
   /* USER CODE END Error_Handler_Debug */
 }
