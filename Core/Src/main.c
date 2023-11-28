@@ -24,17 +24,20 @@
 #include "stdio.h"
 #include "stdint.h"
 #include "string.h"
+#include "math.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 typedef struct
 {
-	uint16_t voltage_src;
-	uint16_t shunt_voltage;
-	uint16_t bus_voltage;
+	float voltage_src;
+	uint16_t shunt_voltage_raw; //having negative value
+	float shunt_voltage;
+	uint16_t bus_voltage_raw;
+	float bus_voltage;
 	uint16_t current;
-	uint16_t power; //Performance (hieu suat)
+	uint16_t power; //Performance (hieu suat) - having negative value
 }INA219_Measurement;
 
 /* USER CODE END PTD */
@@ -48,7 +51,7 @@ typedef struct
 
 //////////// INA219 ////////////
 //Define device address
-#define INA219_SLAVE_ADDRESS 0x40<<1
+#define INA219_SLAVE_ADDRESS (0x40<<1)
 //Define i2c protocol sensor register address - BEGIN
 #define INA219_CONFIG_REG 0x007
 #define INA219_SHUNTVOLTAGE_REG 0x01
@@ -57,7 +60,6 @@ typedef struct
 #define INA219_CURRENT_REG 0x04
 #define INA219_CALLIB_REG 0x05
 //Define i2c protocol sensor register address - END
-
 ///////////////////////////////
 /* USER CODE END PD */
 
@@ -77,9 +79,11 @@ UART_HandleTypeDef huart1;
 uint32_t raw_temperature_val = 0; //digital value output value from adc
 float voltage_temperature_convert = 0; //Voltage analog value convert
 float temperature = 0; //temperature after processing
-uint8_t Tx_Buffer[100]; //UART buffer
+uint8_t Tx_Buffer[2048]; //UART buffer
+//in future targ. tạo mảng động
+uint8_t Ina219_ready_readflag = 0;
 
-INA219_Measurement ina_basic_measure;
+INA219_Measurement ina1;
 
 /* USER CODE END PV */
 
@@ -93,10 +97,69 @@ static void MX_I2C1_Init(void);
 void Ina219_Init(void);
 uint16_t eightbit_to_16bit_conv(uint8_t num1,uint8_t num2);
 void Ina219_Read_Value(INA219_Measurement *pTarget);
+float conversion(uint16_t dec_num);
+void debug_show(); //recreate this func to make it more reusable in future
+//First determine what kind of input we could have, how to print it out?
+//pointer to value
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+float conversion(uint16_t dec_num)
+{
+    // array to store binary number
+    uint8_t binaryNum[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    //						LSB								MSB
+    float conv_result = 0;
+
+    // counter for binary array
+    int i = 0;
+    while (dec_num > 0) {
+
+        // storing remainder in binary array
+        binaryNum[i] = dec_num % 2;
+        dec_num = dec_num / 2;
+        i++;
+    }
+
+    for (int j = 0; j < i; j++)
+    {
+        if(j==15 && binaryNum[j]==1)
+        {
+        	conv_result += (int)(pow(2,j)*(-1));
+        }
+    }
+
+    binaryNum[0] -= 1; //tru chua dung
+
+    // printing binary array in reverse order
+    for (int j = 0; j < i; j++)
+    {
+    	//thuc hien bu 2
+    	//1 dao bit
+    	//2 cong 1
+    	binaryNum[j] = !binaryNum[j];
+    }
+
+    for (int j = 0; j < i; j++)
+    {
+    	if(binaryNum[j]==1)
+    	{
+    		conv_result += (int)(pow(2,j));
+    	}
+    }
+
+//    memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
+//    sprintf((char*)Tx_Buffer,"conv-res: %.2f",(float)conv_result/100);
+//    HAL_UART_Transmit(&huart1,Tx_Buffer,sizeof(Tx_Buffer), 10);
+//    HAL_Delay(1000);
+
+    return conv_result;
+}
+
+
+
 void Ina219_Init(void)
 {
 	uint8_t buffer[3];
@@ -105,20 +168,24 @@ void Ina219_Init(void)
 	buffer[2] = 0x9A; //LSB callib reg
 	//init ina219 callibration
 	//28ms is time out value based on ina219 datasheet corresponding to SMBus
-	if(HAL_I2C_Master_Transmit(&hi2c1, INA219_SLAVE_ADDRESS,buffer,3,28) != HAL_OK) //that ra neu de noi ma init successfully thi phai check gia tri duoc ghi co that sư ghi chua
+	if(HAL_I2C_Master_Transmit(&hi2c1, INA219_SLAVE_ADDRESS,buffer,3,28)==HAL_OK)
 	{
-		 memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
-		 sprintf((char*)Tx_Buffer,"INA219: I2C TRANSMIT CALLIB SUCCESSFULLY!\n");
-		 HAL_Delay(100);
-		 memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
-		 sprintf((char*)Tx_Buffer,"Ready to read data...\n");
-		 HAL_Delay(100);
-	}
-	else {
 		memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
-		sprintf((char*)Tx_Buffer,"INA219: TRANSMIT CALLIB FAILED!\n");
-		HAL_Delay(100);
+		sprintf((char*)Tx_Buffer,"INA219: I2C TRANSMIT CALLIB SUCCESSFULLY!\nReady to read..");
+		HAL_UART_Transmit(&huart1,Tx_Buffer,sizeof(Tx_Buffer), 10);
+		Ina219_ready_readflag = 1;
+	} else if (HAL_I2C_Master_Transmit(&hi2c1, INA219_SLAVE_ADDRESS,buffer,3,28)==HAL_ERROR)
+	{
+		memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
+		sprintf((char*)Tx_Buffer,"INA219: I2C TRANSMIT CALLIB ERROR!\n");
+		HAL_UART_Transmit(&huart1,Tx_Buffer,sizeof(Tx_Buffer), 10);
+	} else if (HAL_I2C_Master_Transmit(&hi2c1, INA219_SLAVE_ADDRESS,buffer,3,28)==HAL_BUSY)
+	{
+		memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
+		sprintf((char*)Tx_Buffer,"INA219: I2C TRANSMIT CALLIB BUSY!\n");
+		HAL_UART_Transmit(&huart1,Tx_Buffer,sizeof(Tx_Buffer), 10);
 	}
+	HAL_Delay(1000);
 }
 
 void Ina219_Read_Value(INA219_Measurement *pTarget)
@@ -128,28 +195,113 @@ void Ina219_Read_Value(INA219_Measurement *pTarget)
 	uint8_t shuntvoltage_val_buffer[2];
 	uint8_t power_val_buffer[2];
 
-	//bus voltage handle
-	HAL_I2C_Master_Transmit(&hi2c1, INA219_SLAVE_ADDRESS,(uint8_t*)INA219_CURRENT_REG,1,28);
-	HAL_I2C_Master_Receive(&hi2c1, INA219_SLAVE_ADDRESS,current_val_buffer,2,28);
+	//current handle - Fix to read right shunt voltage with = signed value
+	if(HAL_I2C_Master_Transmit(&hi2c1, INA219_SLAVE_ADDRESS,(uint8_t*)INA219_CURRENT_REG,1,28)==HAL_OK)
+	{
+		 //memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
+		 //sprintf((char*)Tx_Buffer,"INA219: I2C POINT TO CURRENT REGISTER SUCCESSFULLY!\nReady to read..");
+		 //HAL_UART_Transmit(&huart1,Tx_Buffer,sizeof(Tx_Buffer), 10);
+		 //HAL_Delay(1000);
+
+		 if(HAL_I2C_Master_Receive(&hi2c1, INA219_SLAVE_ADDRESS,current_val_buffer,2,28) == HAL_OK)
+		 {
+			 pTarget->current = eightbit_to_16bit_conv(current_val_buffer[0], current_val_buffer[1]);
+		 }
+	} else
+	{
+		//throw error
+		memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
+		sprintf((char*)Tx_Buffer,"INA219: READ CURRENT FAILED!\n");
+		HAL_UART_Transmit(&huart1,Tx_Buffer,sizeof(Tx_Buffer), 10);
+		HAL_Delay(1000);
+	}
 
 	//bus voltage handle
-	HAL_I2C_Master_Transmit(&hi2c1, INA219_SLAVE_ADDRESS,(uint8_t*)INA219_BUSVOLTAGE_REG,1,28);
-	HAL_I2C_Master_Receive(&hi2c1, INA219_SLAVE_ADDRESS,bus_voltage_val_buffer,2,28);
+	if(HAL_I2C_Master_Transmit(&hi2c1, INA219_SLAVE_ADDRESS,(uint8_t*)INA219_BUSVOLTAGE_REG,1,28)==HAL_OK)
+	{
+		//memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
+		//sprintf((char*)Tx_Buffer,"INA219: I2C POINT TO BV REGISTER SUCCESSFULLY!\nReady to read..");
+		//HAL_UART_Transmit(&huart1,Tx_Buffer,sizeof(Tx_Buffer), 10);
+		//HAL_Delay(1000);
 
-	//power handle
-	HAL_I2C_Master_Transmit(&hi2c1, INA219_SLAVE_ADDRESS,(uint8_t*)INA219_POWER_REG,1,28);
-	HAL_I2C_Master_Receive(&hi2c1, INA219_SLAVE_ADDRESS,power_val_buffer,2,28);
+		if(HAL_I2C_Master_Receive(&hi2c1, INA219_SLAVE_ADDRESS, bus_voltage_val_buffer,2,28) == HAL_OK)
+		{
+			pTarget->bus_voltage_raw = eightbit_to_16bit_conv( bus_voltage_val_buffer[0],  bus_voltage_val_buffer[1]);
+		}
+	} else
+	{
+		//throw error
+		memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
+		sprintf((char*)Tx_Buffer,"INA219: READ BV FAILED!\n");
+		HAL_UART_Transmit(&huart1,Tx_Buffer,sizeof(Tx_Buffer), 10);
+		HAL_Delay(1000);
+	}
 
-	//shunt voltage handle - may need to be calculated more to get accurate result with 2's complement
-	HAL_I2C_Master_Transmit(&hi2c1, INA219_SLAVE_ADDRESS,(uint8_t*)INA219_SHUNTVOLTAGE_REG,1,28);
-	HAL_I2C_Master_Receive(&hi2c1, INA219_SLAVE_ADDRESS,shuntvoltage_val_buffer,2,28);
+	//Power handle
+	if(HAL_I2C_Master_Transmit(&hi2c1, INA219_SLAVE_ADDRESS,(uint8_t*)INA219_POWER_REG,1,28)==HAL_OK)
+	{
+		//memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
+		//sprintf((char*)Tx_Buffer,"INA219: I2C POINT TO BV REGISTER POWER!\nReady to read..");
+		//HAL_UART_Transmit(&huart1,Tx_Buffer,sizeof(Tx_Buffer), 10);
+		//HAL_Delay(1000);
 
-	pTarget->current = eightbit_to_16bit_conv(current_val_buffer[0], current_val_buffer[1]);
-	pTarget->bus_voltage = eightbit_to_16bit_conv(bus_voltage_val_buffer[0], bus_voltage_val_buffer[1]);
-	pTarget->shunt_voltage = eightbit_to_16bit_conv(shuntvoltage_val_buffer[0], shuntvoltage_val_buffer[1]);
-	pTarget->power = eightbit_to_16bit_conv(power_val_buffer[0], power_val_buffer[1]);
+		if(HAL_I2C_Master_Receive(&hi2c1, INA219_SLAVE_ADDRESS, power_val_buffer,2,28) == HAL_OK)
+		{
+			pTarget->power = eightbit_to_16bit_conv(power_val_buffer[0],power_val_buffer[1]);
+		}
+	} else
+	{
+			//throw error
+			memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
+			sprintf((char*)Tx_Buffer,"INA219: READ POWER FAILED!\n");
+			HAL_UART_Transmit(&huart1,Tx_Buffer,sizeof(Tx_Buffer), 10);
+			HAL_Delay(1000);
+	}
 
-	pTarget->voltage_src = pTarget->shunt_voltage + pTarget->bus_voltage;
+	//Shunt voltage handle - Fix to read right shunt voltage with = signed value
+	if(HAL_I2C_Master_Transmit(&hi2c1, INA219_SLAVE_ADDRESS,(uint8_t*)INA219_SHUNTVOLTAGE_REG,1,28)==HAL_OK)
+	{
+		//memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
+		//sprintf((char*)Tx_Buffer,"INA219: I2C POINT TO BV REGISTER SUCCESSFULLY!\nReady to read..");
+		//HAL_UART_Transmit(&huart1,Tx_Buffer,sizeof(Tx_Buffer), 10);
+		//HAL_Delay(1000);
+
+		if(HAL_I2C_Master_Receive(&hi2c1, INA219_SLAVE_ADDRESS,shuntvoltage_val_buffer,2,28) == HAL_OK)
+		{
+			pTarget->shunt_voltage_raw = eightbit_to_16bit_conv(shuntvoltage_val_buffer[0],shuntvoltage_val_buffer[1]);
+			//raw_shuntvoltage = pTarget->shunt_voltage; //neu cai nay ra duoc số âm thì convert to uint8_t
+		}
+	} else
+	{
+		//throw error
+		memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
+		sprintf((char*)Tx_Buffer,"INA219: READ SHUNT VOLTAGE FAILED!\n");
+		HAL_UART_Transmit(&huart1,Tx_Buffer,sizeof(Tx_Buffer), 10);
+		HAL_Delay(1000);
+	}
+
+	 pTarget->shunt_voltage = conversion(pTarget->shunt_voltage_raw)/100; //inlude accruracy to 0.01mV
+	 pTarget->bus_voltage = ((pTarget->bus_voltage_raw>>3)*4)/100; //4mV corresponding
+
+	 pTarget->voltage_src = pTarget->shunt_voltage + pTarget->bus_voltage;
+
+	 //memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
+	 sprintf((char*)Tx_Buffer,"Vshu.: %.2f mV\nVbus: %.2f V\nVsrc: %.2f V",pTarget->shunt_voltage,pTarget->bus_voltage,pTarget->voltage_src);
+	 //sprintf((char*)Tx_Buffer,"Temp.: %.2f C\nCurrent: %u A\nBus Volt.: %u V\nPower: %u W\nShunt Vol.: %u V\n",temperature,ina1.current/4096,ina1.bus_voltage/4096,ina1.power/4096,ina1.shunt_voltage*(10/1000000)/4096);
+
+	 //sprintf((char*)Tx_Buffer,"Temp.: %.2f C\nShunt V.: %d mV\n",temperature,ina1.shunt_voltage);
+	 HAL_UART_Transmit(&huart1,Tx_Buffer,sizeof(Tx_Buffer), 10);
+	 HAL_Delay(500);
+}
+
+void debug_show()
+{
+	 //memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
+	 //sprintf((char*)Tx_Buffer,"Temp.: %.2f C\nCurrent: %u A\nBus Volt.: %u V\nPower: %u W\nShunt Vol.: %u V\n",temperature,ina1.current/4096,ina1.bus_voltage/4096,ina1.power/4096,ina1.shunt_voltage*(10/1000000)/4096);
+
+	 //sprintf((char*)Tx_Buffer,"Temp.: %.2f C\nShunt V.: %d mV\n",temperature,ina1.shunt_voltage);
+	 //HAL_UART_Transmit(&huart1,Tx_Buffer,sizeof(Tx_Buffer), 10);
+	 //HAL_Delay(500);
 }
 
 uint16_t eightbit_to_16bit_conv(uint8_t num1,uint8_t num2)
@@ -157,7 +309,6 @@ uint16_t eightbit_to_16bit_conv(uint8_t num1,uint8_t num2)
 	uint16_t result = (num1 << 8) | num2;
 	return result;
 }
-
 
 
 
@@ -204,6 +355,7 @@ int main(void)
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
   HAL_ADC_Start_IT(&hadc1);
+
   Ina219_Init();
   /* USER CODE END 2 */
 
@@ -213,19 +365,18 @@ int main(void)
   {
 	  ////////////LM35 - TEMPERATURE SENSOR //////////////
 	  //calculation to get temperature
-	  //voltage_temperature_convert = (float)raw_temperature_val*MAX_CONV_RANGE/MAX_ADC_RESOLUTION_VAL;
-	  //temperature = voltage_temperature_convert*100;
+	  voltage_temperature_convert = (float)raw_temperature_val*MAX_CONV_RANGE/MAX_ADC_RESOLUTION_VAL;
+	  temperature = voltage_temperature_convert*100;
 	  ////////////LM35 - TEMPERATURE SENSOR //////////////
-
 	  ////////////INA219 - TEMPERATURE SENSOR //////////////
-	  //ina219_Read_Value(&ina_basic_measure);
+	  if(Ina219_ready_readflag)
+	  {
+		  Ina219_Read_Value(&ina1);
+	  }
 	  ////////////INA219 - TEMPERATURE SENSOR //////////////
 
 	  ////////////DEBUG OLED SSD1306 - ESP32 THROUGH UART //////////////
-	  //memset(Tx_Buffer,0,sizeof(Tx_Buffer)); //clear buffer before write
-	  //sprintf((char*)Tx_Buffer,"Temp: %.2f C",temperature);
-	  //HAL_UART_Transmit(&huart1,Tx_Buffer,sizeof(Tx_Buffer), 10);
-	  //HAL_Delay(100); //each 500ms display temperature once
+	  debug_show();
 	  ////////////DEBUG OLED SSD1306 - ESP32 THROUGH UART //////////////
     /* USER CODE END WHILE */
 
